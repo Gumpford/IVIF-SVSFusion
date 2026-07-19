@@ -289,10 +289,18 @@ class PatchEmbed(nn.Module):
         self.norm = norm_layer(emb_size) if patch_norm else nn.Identity()
 
     def forward(self, x):
+        # Forward branch: upper-left -> lower-right.
         x = self.conv(x)
-        x_sorted = self.permute(x)
-        x_reverse = torch.flip(x_sorted, dims=[1])
-        x = torch.cat((x_sorted, x_reverse), dim=0)
+        x_forward = self.permute(x)  # [B, H_p, W_p, C]
+
+        # Reverse branch: lower-right -> upper-left.
+        # Flipping both spatial axes is equivalent to a 180-degree
+        # reversal of the native 2D patch lattice.
+        x_reverse = torch.flip(x_forward, dims=(1, 2)).contiguous()
+
+        # The two sweeps are processed by the same WITRAN encoder,
+        # so they share all recurrent parameters.
+        x = torch.cat((x_forward, x_reverse), dim=0)
         x = self.norm(x)
         return x
 class Unpatchify(nn.Module):
@@ -308,13 +316,23 @@ class Unpatchify(nn.Module):
 
     def forward(self, x):
         if not self.channel_first:
-            x = self.permute(x)
-        x1, x2 = torch.chunk(x, chunks=2, dim=0)
-        x2 = torch.flip(x2, dims=[1])
-        x1 = self.conv_transpose(x1)
-        x2 = self.conv_transpose(x2)
-        x = x1 + x2
-        return x
+            x = self.permute(x)  # [2B, C, H_p, W_p]
+
+        if x.shape[0] % 2 != 0:
+            raise ValueError(
+                "The batch dimension must be even because it contains "
+                "paired forward and reverse water-wave sweeps."
+            )
+
+        x_forward, x_reverse = torch.chunk(x, chunks=2, dim=0)
+
+        # Align the reverse-sweep representation with the original
+        # spatial coordinates before aggregating the two directions.
+        x_reverse = torch.flip(x_reverse, dims=(2, 3)).contiguous()
+
+        x_forward = self.conv_transpose(x_forward)
+        x_reverse = self.conv_transpose(x_reverse)
+        return x_forward + x_reverse
 
 def make_patch_embed(x, patch_size):
     x = x.permute(0, 2, 3, 1).contiguous()
